@@ -184,7 +184,7 @@ def get_markets(limit=20):
                 yes_bid = round(float(m.get("yes_bid_dollars") or 0) * 100)
                 no_bid  = round(float(m.get("no_bid_dollars")  or 0) * 100)
                 # Skip zero prices and extreme prices (sports parlays etc)
-                if yes_bid < 3 or yes_bid > 97 or no_bid < 3 or no_bid > 97:
+                if yes_bid < 1 or yes_bid > 99 or no_bid < 1 or no_bid > 99:
                     continue
                 markets_out.append({
                     "id": m["ticker"],
@@ -201,11 +201,11 @@ def get_markets(limit=20):
         if markets_out:
             log.info(f"Live tickers: {[m['id'] for m in markets_out[:5]]}")
             return markets_out
-        log.warning("No valid markets from API — using demo markets")
-        return DEMO_MARKETS
+        log.warning(f"No valid markets after filtering {len(raw)} raw markets — waiting for next cycle")
+        return []
     except Exception as e:
-        log.warning(f"Market fetch failed: {e} — using demo markets")
-        return DEMO_MARKETS
+        log.warning(f"Market fetch failed: {e}")
+        return []
 
 def get_public_trades(limit=200):
     try:
@@ -363,6 +363,9 @@ def run_compound_cycle(markets, whale_signals):
     best_boost   = 0
 
     scan_markets = markets[:MAX_MARKETS_SCAN]
+    if not scan_markets:
+        log.warning("No markets available this cycle — skipping")
+        return
     log.info(f"Scanning {len(scan_markets)} markets...")
     log.info(f"Market tickers: {[m['id'] for m in scan_markets]}")
 
