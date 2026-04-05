@@ -177,6 +177,7 @@ def get_markets(limit=20):
             log.warning("No valid markets — using demo markets")
             return DEMO_MARKETS
         log.info(f"Loaded {len(markets_out)} valid markets")
+        log.info(f"Tickers: {[m['id'] for m in markets_out[:8]]}")
         return markets_out
     except Exception as e:
         log.warning(f"Market fetch failed: {e} — using demo markets")
@@ -339,6 +340,7 @@ def run_compound_cycle(markets, whale_signals):
 
     scan_markets = markets[:MAX_MARKETS_SCAN]
     log.info(f"Scanning {len(scan_markets)} markets...")
+    log.info(f"Market tickers: {[m['id'] for m in scan_markets]}")
 
     for m in scan_markets:
         ws = whale_signals.get(m["id"])
