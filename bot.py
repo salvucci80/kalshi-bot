@@ -20,6 +20,11 @@ import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 import anthropic
+import base64
+import datetime as dt
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.backends import default_backend
 
 load_dotenv()
 
@@ -46,6 +51,8 @@ WHALE_BOOST         = float(os.getenv("WHALE_BOOST", "8"))           # % conf bo
 CYCLE_INTERVAL      = int(os.getenv("CYCLE_INTERVAL", "60"))         # seconds between compound cycles
 DEMO_MODE           = os.getenv("DEMO_MODE", "true").lower() == "true"
 MAX_MARKETS_SCAN    = int(os.getenv("MAX_MARKETS_SCAN", "10"))
+# RSA private key as a string in env (paste full PEM including header/footer)
+KALSHI_PRIVATE_KEY  = os.getenv("KALSHI_PRIVATE_KEY", "")
 
 KALSHI_BASE  = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_TRADE = "https://trading-api.kalshi.com/trade-api/v2"
@@ -65,15 +72,53 @@ total_trades  = 0
 growth_log    = [STARTING_BANKROLL]
 
 # ── Kalshi API ────────────────────────────────────────────────────────────────
-def kalshi_headers():
+def _load_private_key():
+    """Load RSA private key from env variable (PEM string)."""
+    if not KALSHI_PRIVATE_KEY:
+        return None
+    try:
+        pem = KALSHI_PRIVATE_KEY.replace("\\n", "\n").encode("utf-8")
+        return serialization.load_pem_private_key(pem, password=None, backend=default_backend())
+    except Exception as e:
+        log.error(f"Failed to load private key: {e}")
+        return None
+
+def _sign(method: str, path: str) -> dict:
+    """Generate Kalshi RSA-signed headers for a request."""
+    private_key = _load_private_key()
+    if not private_key or not KALSHI_API_KEY:
+        return {"Content-Type": "application/json"}
+    # Timestamp in milliseconds
+    ts_ms = str(int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000))
+    # Strip query params before signing
+    path_no_query = path.split("?")[0]
+    msg = (ts_ms + method.upper() + path_no_query).encode("utf-8")
+    signature = private_key.sign(
+        msg,
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.DIGEST_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+    sig_b64 = base64.b64encode(signature).decode("utf-8")
     return {
-        "Authorization": f"Bearer {KALSHI_API_KEY}",
         "Content-Type": "application/json",
+        "KALSHI-ACCESS-KEY": KALSHI_API_KEY,
+        "KALSHI-ACCESS-SIGNATURE": sig_b64,
+        "KALSHI-ACCESS-TIMESTAMP": ts_ms,
     }
+
+def kalshi_headers():
+    """Legacy helper — used for public endpoints that don't need signing."""
+    if KALSHI_API_KEY:
+        return _sign("GET", "/trade-api/v2/portfolio/balance")
+    return {"Content-Type": "application/json"}
 
 def get_balance():
     try:
-        r = requests.get(f"{KALSHI_TRADE}/portfolio/balance", headers=kalshi_headers(), timeout=10)
+        path = "/trade-api/v2/portfolio/balance"
+        r = requests.get(f"{KALSHI_TRADE}{path}", headers=_sign("GET", path), timeout=10)
         r.raise_for_status()
         return r.json().get("balance", 0) / 100
     except Exception as e:
@@ -133,6 +178,7 @@ def place_order(ticker, side, price_cents, count):
         log.info(f"[DEMO] Would place: {count}x {side.upper()} @ {price_cents}¢ on {ticker}")
         return True
     try:
+        path = "/trade-api/v2/portfolio/orders"
         payload = {
             "ticker": ticker,
             "action": "buy",
@@ -145,8 +191,8 @@ def place_order(ticker, side, price_cents, count):
         else:
             payload["no_price"] = price_cents
         r = requests.post(
-            f"{KALSHI_TRADE}/portfolio/orders",
-            headers=kalshi_headers(),
+            f"{KALSHI_TRADE}{path}",
+            headers=_sign("POST", path),
             json=payload,
             timeout=10,
         )
