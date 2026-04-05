@@ -163,12 +163,9 @@ def get_markets(limit=20):
             try:
                 yes_bid = round(float(m.get("yes_bid_dollars") or 0) * 100)
                 no_bid  = round(float(m.get("no_bid_dollars")  or 0) * 100)
-                # Only skip completely zero prices
-                if yes_bid == 0 and no_bid == 0:
+                # Skip zero prices and extreme prices (sports parlays etc)
+                if yes_bid < 3 or yes_bid > 97 or no_bid < 3 or no_bid > 97:
                     continue
-                # Use 50 as fallback if one side is missing
-                if yes_bid == 0: yes_bid = 100 - no_bid
-                if no_bid == 0: no_bid = 100 - yes_bid
                 markets_out.append({
                     "id": m["ticker"],
                     "title": m.get("title", m["ticker"]),
