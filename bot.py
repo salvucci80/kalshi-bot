@@ -133,15 +133,49 @@ def get_balance():
         path = "/trade-api/v2/portfolio/balance"
         hdrs = _sign("GET", path)
         r = requests.get(f"{KALSHI_TRADE}{path}", headers=hdrs, timeout=10)
-        if r.status_code == 401:
-            log.error(f"Auth 401 — check KALSHI_API_KEY and KALSHI_PRIVATE_KEY")
-            log.error(f"Response: {r.text[:300]}")
+        log.info(f"Balance API status: {r.status_code}")
+        if not r.ok:
+            log.error(f"Balance fetch error: {r.status_code} {r.text[:200]}")
             return None
-        r.raise_for_status()
-        return r.json().get("balance", 0) / 100
+        data = r.json()
+        log.info(f"Balance response: {data}")
+        # Kalshi returns balance in cents
+        bal = data.get("balance", 0) / 100
+        log.info(f"Available balance: ${bal:.2f}")
+        return bal
     except Exception as e:
         log.error(f"Balance fetch failed: {e}")
         return None
+
+def cancel_resting_orders():
+    """Cancel all open resting orders before placing a new one."""
+    try:
+        path = "/trade-api/v2/portfolio/orders"
+        hdrs = _sign("GET", path)
+        r = requests.get(f"{KALSHI_TRADE}{path}", params={"status": "resting"}, headers=hdrs, timeout=10)
+        if not r.ok:
+            log.warning(f"Could not fetch resting orders: {r.status_code}")
+            return
+        orders = r.json().get("orders", [])
+        if not orders:
+            return
+        log.info(f"Cancelling {len(orders)} resting orders to free balance...")
+        for order in orders:
+            oid = order.get("order_id")
+            if not oid:
+                continue
+            try:
+                del_path = f"/trade-api/v2/portfolio/orders/{oid}"
+                del_hdrs = _sign("DELETE", del_path)
+                dr = requests.delete(f"{KALSHI_TRADE}{del_path}", headers=del_hdrs, timeout=10)
+                if dr.ok:
+                    log.info(f"Cancelled order {oid[:8]}...")
+                else:
+                    log.warning(f"Could not cancel {oid[:8]}: {dr.status_code}")
+            except Exception as e:
+                log.warning(f"Cancel failed for {oid}: {e}")
+    except Exception as e:
+        log.error(f"cancel_resting_orders failed: {e}")
 
 def get_markets(limit=20):
     try:
@@ -305,7 +339,9 @@ def kelly_bet(prob_pct, market_price_cents, whale_boost_pct=0):
         return {"f": 0, "f_raw": 0, "bet_size": 0, "b": b, "p": p, "edge": 0, "price": price}
     f = kelly_fraction(p, b)
     f_capped = min(f, KELLY_CAP)
-    bet_size = round(f_capped * bankroll, 2)
+    # Hard cap: never bet more than 90% of bankroll to leave buffer for fees/rounding
+    max_bet = round(bankroll * 0.90, 2)
+    bet_size = round(min(f_capped * bankroll, max_bet), 2)
     edge = p - (1 - p) / b
     return {
         "f": f_capped,
@@ -371,6 +407,10 @@ def run_compound_cycle(markets, whale_signals):
                 log.info(f"Balance sync: bot had ${bankroll:.2f}, Kalshi shows ${live_bal:.2f}")
             bankroll = live_bal
             peak_bankroll = max(peak_bankroll, bankroll)
+    # Cancel any previous resting orders to free up balance
+    if not DEMO_MODE and KALSHI_API_KEY:
+        cancel_resting_orders()
+
     log.info("=" * 60)
     log.info(f"Compound cycle | Bankroll: ${bankroll:.2f} | Trades: {total_trades} | W/L: {wins}/{losses}")
 
