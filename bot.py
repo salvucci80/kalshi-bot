@@ -145,39 +145,48 @@ def get_balance():
 
 def get_markets(limit=20):
     try:
-        # Fetch multiple categories to find real binary markets
-        all_raw = []
-        for series_prefix in ["KX", "KXBTC", "KXINX", "KXETH", "KXFED", "KXCPI", "KXNVDA", "KXGDP"]:
+        # Fetch from known series that have real binary markets with normal prices
+        # Sports parlay markets (KXMVE, KXMVECROSS) always have 0/100¢ prices
+        GOOD_SERIES = [
+            "KXINXW", "KXBTCU", "KXETHU", "KXFED", "KXCPI",
+            "KXGDP", "KXNVDA", "KXUNEMPLOYMENT", "KXSPX", "KXDXY",
+            "KXNFLWINNER", "KXPOTUS", "KXSENATE", "KXHOUSE",
+        ]
+        raw = []
+        for series in GOOD_SERIES:
             try:
                 r2 = requests.get(
                     f"{KALSHI_BASE}/markets",
-                    params={"limit": limit, "status": "open"},
-                    timeout=15,
+                    params={"limit": 10, "status": "open", "series_ticker": series},
+                    timeout=10,
                 )
                 if r2.ok:
-                    all_raw.extend(r2.json().get("markets", []))
-                    break  # Just get the main batch
-            except:
-                pass
-        # Actually just do one clean fetch and log everything
-        r = requests.get(
-            f"{KALSHI_BASE}/markets",
-            params={"limit": 100, "status": "open"},
-            timeout=15,
-        )
-        log.info(f"Markets API status: {r.status_code}")
-        r.raise_for_status()
-        raw = r.json().get("markets", [])
-        log.info(f"Raw markets returned: {len(raw)}")
-        if raw:
-            m0 = raw[0]
-            log.info(f"Sample: ticker={m0.get('ticker')} yes_bid={m0.get('yes_bid_dollars')} no_bid={m0.get('no_bid_dollars')}")
-            # Log price distribution
-            prices = []
-            for m in raw[:20]:
-                yb = float(m.get("yes_bid_dollars") or 0) * 100
-                prices.append(f"{m.get('ticker','?')[:15]}={yb:.0f}¢")
-            log.info(f"Price sample: {prices[:10]}")
+                    found = r2.json().get("markets", [])
+                    raw.extend(found)
+                    if found:
+                        log.info(f"Series {series}: {len(found)} markets, sample price={float(found[0].get('yes_bid_dollars') or 0)*100:.0f}¢")
+            except Exception as se:
+                log.debug(f"Series {series} failed: {se}")
+
+        if not raw:
+            # Fallback: paginate through markets to find ones with real prices
+            for page in range(5):
+                try:
+                    params = {"limit": 100, "status": "open"}
+                    r2 = requests.get(f"{KALSHI_BASE}/markets", params=params, timeout=15)
+                    if r2.ok:
+                        batch = r2.json().get("markets", [])
+                        for m in batch:
+                            yb = float(m.get("yes_bid_dollars") or 0) * 100
+                            nb = float(m.get("no_bid_dollars") or 0) * 100
+                            if 3 <= yb <= 97 and 3 <= nb <= 97:
+                                raw.append(m)
+                        if raw:
+                            break
+                except:
+                    break
+
+        log.info(f"Total candidate markets: {len(raw)}")
         markets_out = []
         for m in raw:
             try:
