@@ -55,7 +55,7 @@ MAX_MARKETS_SCAN    = int(os.getenv("MAX_MARKETS_SCAN", "10"))
 KALSHI_PRIVATE_KEY  = os.getenv("KALSHI_PRIVATE_KEY", "")
 
 KALSHI_BASE  = "https://api.elections.kalshi.com/trade-api/v2"
-KALSHI_TRADE = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_TRADE = "https://trading-api.kalshi.com"
 
 SOURCE_CREDIBILITY = {
     "Reuters": 0.95, "Bloomberg": 0.93, "AP": 0.92, "WSJ": 0.90,
@@ -73,12 +73,27 @@ growth_log    = [STARTING_BANKROLL]
 
 # ── Kalshi API ────────────────────────────────────────────────────────────────
 def _load_private_key():
-    """Load RSA private key from env variable (PEM string)."""
+    """Load RSA private key from env variable (PEM string).
+    Handles both real newlines and escaped \n from Railway env vars.
+    """
     if not KALSHI_PRIVATE_KEY:
         return None
     try:
-        pem = KALSHI_PRIVATE_KEY.replace("\\n", "\n").encode("utf-8")
-        return serialization.load_pem_private_key(pem, password=None, backend=default_backend())
+        # Normalize: handle escaped newlines from env var storage
+        pem_str = KALSHI_PRIVATE_KEY
+        # Replace literal \n (escaped) with real newlines
+        if "\\n" in pem_str:
+            pem_str = pem_str.replace("\\n", "\n")
+        # Also handle if someone typed \n literally in Railway UI
+        pem_str = pem_str.replace("\n", "\n")
+        # Ensure proper PEM format
+        if not pem_str.startswith("-----"):
+            log.error("Private key doesn't look like PEM format")
+            return None
+        pem = pem_str.encode("utf-8")
+        key = serialization.load_pem_private_key(pem, password=None, backend=default_backend())
+        log.info("RSA private key loaded successfully")
+        return key
     except Exception as e:
         log.error(f"Failed to load private key: {e}")
         return None
