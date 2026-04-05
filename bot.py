@@ -23,7 +23,7 @@ import anthropic
 import base64
 import datetime as dt
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.backends import default_backend
 
 load_dotenv()
@@ -73,46 +73,47 @@ growth_log    = [STARTING_BANKROLL]
 
 # ── Kalshi API ────────────────────────────────────────────────────────────────
 def _load_private_key():
-    """Load RSA private key from env variable (PEM string).
-    Handles both real newlines and escaped \n from Railway env vars.
-    """
+    """Load RSA private key from env — handles PEM string with real or escaped newlines."""
     if not KALSHI_PRIVATE_KEY:
+        log.warning("KALSHI_PRIVATE_KEY not set")
         return None
     try:
-        # Normalize: handle escaped newlines from env var storage
         pem_str = KALSHI_PRIVATE_KEY
-        # Replace literal \n (escaped) with real newlines
+        # Handle escaped newlines stored in Railway
         if "\\n" in pem_str:
             pem_str = pem_str.replace("\\n", "\n")
-        # Also handle if someone typed \n literally in Railway UI
         pem_str = pem_str.replace("\n", "\n")
-        # Ensure proper PEM format
-        if not pem_str.startswith("-----"):
-            log.error("Private key doesn't look like PEM format")
+        if not pem_str.strip().startswith("-----"):
+            log.error("KALSHI_PRIVATE_KEY doesn't look like PEM format")
             return None
-        pem = pem_str.encode("utf-8")
-        key = serialization.load_pem_private_key(pem, password=None, backend=default_backend())
-        log.info("RSA private key loaded successfully")
+        key = serialization.load_pem_private_key(
+            pem_str.encode("utf-8"), password=None, backend=default_backend()
+        )
+        log.info(f"RSA private key loaded OK ({type(key).__name__})")
         return key
     except Exception as e:
         log.error(f"Failed to load private key: {e}")
         return None
 
 def _sign(method: str, path: str) -> dict:
-    """Generate Kalshi RSA-signed headers for a request."""
+    """Sign a Kalshi API request with RSA-PSS per their official spec."""
     private_key = _load_private_key()
     if not private_key or not KALSHI_API_KEY:
+        log.warning("Missing key/key-id — request will be unsigned")
         return {"Content-Type": "application/json"}
-    # Timestamp in milliseconds
+    # Timestamp in milliseconds (integer string, no decimals)
     ts_ms = str(int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000))
-    # Strip query params before signing
+    # Strip query params — Kalshi signs the path WITHOUT query string
     path_no_query = path.split("?")[0]
-    msg = (ts_ms + method.upper() + path_no_query).encode("utf-8")
+    # Message = timestamp + METHOD_UPPERCASE + path_without_query
+    msg_string = ts_ms + method.upper() + path_no_query
+    msg = msg_string.encode("utf-8")
+    log.debug(f"Signing msg: {msg_string[:80]}")
     signature = private_key.sign(
         msg,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH,
+        asym_padding.PSS(
+            mgf=asym_padding.MGF1(hashes.SHA256()),
+            salt_length=asym_padding.PSS.DIGEST_LENGTH,
         ),
         hashes.SHA256(),
     )
@@ -125,15 +126,17 @@ def _sign(method: str, path: str) -> dict:
     }
 
 def kalshi_headers():
-    """Legacy helper — used for public endpoints that don't need signing."""
-    if KALSHI_API_KEY:
-        return _sign("GET", "/trade-api/v2/portfolio/balance")
-    return {"Content-Type": "application/json"}
+    return _sign("GET", "/trade-api/v2/portfolio/balance")
 
 def get_balance():
     try:
         path = "/trade-api/v2/portfolio/balance"
-        r = requests.get(f"{KALSHI_TRADE}{path}", headers=_sign("GET", path), timeout=10)
+        hdrs = _sign("GET", path)
+        r = requests.get(f"{KALSHI_TRADE}{path}", headers=hdrs, timeout=10)
+        if r.status_code == 401:
+            log.error(f"Auth 401 — check KALSHI_API_KEY and KALSHI_PRIVATE_KEY")
+            log.error(f"Response: {r.text[:300]}")
+            return None
         r.raise_for_status()
         return r.json().get("balance", 0) / 100
     except Exception as e:
@@ -142,10 +145,11 @@ def get_balance():
 
 def get_markets(limit=20):
     try:
+        path = "/trade-api/v2/markets"
         r = requests.get(
-            f"{KALSHI_BASE}/markets",
+            f"{KALSHI_TRADE}{path}",
             params={"limit": limit, "status": "open"},
-            headers=kalshi_headers() if KALSHI_API_KEY else {},
+            headers=_sign("GET", path),
             timeout=10,
         )
         r.raise_for_status()
@@ -155,8 +159,7 @@ def get_markets(limit=20):
         for m in raw:
             yes_bid = round(float(m.get("yes_bid_dollars") or 0) * 100)
             no_bid  = round(float(m.get("no_bid_dollars")  or 0) * 100)
-            # Skip markets with missing, zero, or extreme prices
-            if yes_bid < 2 or yes_bid > 98 or no_bid < 2 or no_bid > 98:
+            if yes_bid <= 0 or no_bid <= 0:
                 skipped += 1
                 continue
             markets_out.append({
@@ -169,11 +172,11 @@ def get_markets(limit=20):
                 "close_time": m.get("close_time", ""),
             })
         if skipped:
-            log.info(f"Skipped {skipped} markets with invalid/extreme prices")
+            log.info(f"Skipped {skipped} markets with invalid prices")
         if not markets_out:
-            log.warning("No valid markets from API — using demo markets")
+            log.warning("No valid markets — using demo markets")
             return DEMO_MARKETS
-        log.info(f"Loaded {len(markets_out)} valid markets from Kalshi")
+        log.info(f"Loaded {len(markets_out)} valid markets")
         return markets_out
     except Exception as e:
         log.warning(f"Market fetch failed: {e} — using demo markets")
@@ -181,7 +184,7 @@ def get_markets(limit=20):
 
 def get_public_trades(limit=200):
     try:
-        r = requests.get(f"{KALSHI_BASE}/trades", params={"limit": limit}, timeout=10)
+        r = requests.get(f"{KALSHI_TRADE}/trade-api/v2/trades", params={"limit": limit}, timeout=10)
         r.raise_for_status()
         return r.json().get("trades", [])
     except Exception as e:
@@ -205,14 +208,19 @@ def place_order(ticker, side, price_cents, count):
             payload["yes_price"] = price_cents
         else:
             payload["no_price"] = price_cents
+        hdrs = _sign("POST", path)
+        log.debug(f"Order headers: KEY={hdrs.get('KALSHI-ACCESS-KEY','?')[:8]}... TS={hdrs.get('KALSHI-ACCESS-TIMESTAMP','?')}")
         r = requests.post(
             f"{KALSHI_TRADE}{path}",
-            headers=_sign("POST", path),
+            headers=hdrs,
             json=payload,
             timeout=10,
         )
+        if r.status_code == 401:
+            log.error(f"Order 401 Unauthorized — response: {r.text[:400]}")
+            return False
         r.raise_for_status()
-        log.info(f"Order placed: {r.json()}")
+        log.info(f"Order placed successfully: {r.json()}")
         return True
     except Exception as e:
         log.error(f"Order failed: {e}")
