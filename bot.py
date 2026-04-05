@@ -55,7 +55,7 @@ MAX_MARKETS_SCAN    = int(os.getenv("MAX_MARKETS_SCAN", "10"))
 KALSHI_PRIVATE_KEY  = os.getenv("KALSHI_PRIVATE_KEY", "")
 
 KALSHI_BASE  = "https://api.elections.kalshi.com/trade-api/v2"
-KALSHI_TRADE = "https://trading-api.kalshi.com"
+KALSHI_TRADE = "https://api.elections.kalshi.com"
 
 SOURCE_CREDIBILITY = {
     "Reuters": 0.95, "Bloomberg": 0.93, "AP": 0.92, "WSJ": 0.90,
