@@ -196,6 +196,7 @@ def place_order(ticker, side, price_cents, count):
         log.info(f"[DEMO] Would place: {count}x {side.upper()} @ {price_cents}¢ on {ticker}")
         return True
     try:
+        import uuid as _uuid
         path = "/trade-api/v2/portfolio/orders"
         payload = {
             "ticker": ticker,
@@ -203,25 +204,29 @@ def place_order(ticker, side, price_cents, count):
             "side": side,
             "type": "limit",
             "count": max(1, int(count)),
+            "client_order_id": str(_uuid.uuid4()),
         }
         if side == "yes":
             payload["yes_price"] = price_cents
         else:
             payload["no_price"] = price_cents
         hdrs = _sign("POST", path)
-        log.debug(f"Order headers: KEY={hdrs.get('KALSHI-ACCESS-KEY','?')[:8]}... TS={hdrs.get('KALSHI-ACCESS-TIMESTAMP','?')}")
+        log.info(f"Sending order to {KALSHI_TRADE}{path}")
+        log.info(f"Payload: {payload}")
         r = requests.post(
             f"{KALSHI_TRADE}{path}",
             headers=hdrs,
             json=payload,
             timeout=10,
         )
-        if r.status_code == 401:
-            log.error(f"Order 401 Unauthorized — response: {r.text[:400]}")
+        log.info(f"Order response status: {r.status_code}")
+        log.info(f"Order response body: {r.text[:500]}")
+        if r.status_code in (200, 201):
+            log.info(f"Order placed successfully!")
+            return True
+        else:
+            log.error(f"Order failed {r.status_code}: {r.text[:400]}")
             return False
-        r.raise_for_status()
-        log.info(f"Order placed successfully: {r.json()}")
-        return True
     except Exception as e:
         log.error(f"Order failed: {e}")
         return False
