@@ -145,39 +145,47 @@ def get_balance():
 
 def get_markets(limit=20):
     try:
-        # Market data is public — no auth needed
         r = requests.get(
             f"{KALSHI_BASE}/markets",
             params={"limit": limit, "status": "open"},
-            timeout=10,
+            timeout=15,
         )
+        log.info(f"Markets API status: {r.status_code}")
         r.raise_for_status()
         raw = r.json().get("markets", [])
+        log.info(f"Raw markets returned: {len(raw)}")
+        if raw:
+            # Log first market to see structure
+            m0 = raw[0]
+            log.info(f"Sample market: ticker={m0.get('ticker')} yes_bid={m0.get('yes_bid_dollars')} no_bid={m0.get('no_bid_dollars')} status={m0.get('status')}")
         markets_out = []
-        skipped = 0
         for m in raw:
-            yes_bid = round(float(m.get("yes_bid_dollars") or 0) * 100)
-            no_bid  = round(float(m.get("no_bid_dollars")  or 0) * 100)
-            if yes_bid <= 0 or no_bid <= 0:
-                skipped += 1
-                continue
-            markets_out.append({
-                "id": m["ticker"],
-                "title": m.get("title", m["ticker"]),
-                "yes_bid": yes_bid,
-                "no_bid": no_bid,
-                "category": m.get("category", "General"),
-                "volume": float(m.get("volume_fp", 0)) * 100,
-                "close_time": m.get("close_time", ""),
-            })
-        if skipped:
-            log.info(f"Skipped {skipped} markets with invalid prices")
-        if not markets_out:
-            log.warning("No valid markets — using demo markets")
-            return DEMO_MARKETS
-        log.info(f"Loaded {len(markets_out)} valid markets")
-        log.info(f"Tickers: {[m['id'] for m in markets_out[:8]]}")
-        return markets_out
+            try:
+                yes_bid = round(float(m.get("yes_bid_dollars") or 0) * 100)
+                no_bid  = round(float(m.get("no_bid_dollars")  or 0) * 100)
+                # Only skip completely zero prices
+                if yes_bid == 0 and no_bid == 0:
+                    continue
+                # Use 50 as fallback if one side is missing
+                if yes_bid == 0: yes_bid = 100 - no_bid
+                if no_bid == 0: no_bid = 100 - yes_bid
+                markets_out.append({
+                    "id": m["ticker"],
+                    "title": m.get("title", m["ticker"]),
+                    "yes_bid": yes_bid,
+                    "no_bid": no_bid,
+                    "category": m.get("category", "General"),
+                    "volume": float(m.get("volume_fp", 0)) * 100,
+                    "close_time": m.get("close_time", ""),
+                })
+            except Exception as me:
+                log.debug(f"Skipping market {m.get('ticker')}: {me}")
+        log.info(f"Loaded {len(markets_out)} valid live markets")
+        if markets_out:
+            log.info(f"Live tickers: {[m['id'] for m in markets_out[:5]]}")
+            return markets_out
+        log.warning("No valid markets from API — using demo markets")
+        return DEMO_MARKETS
     except Exception as e:
         log.warning(f"Market fetch failed: {e} — using demo markets")
         return DEMO_MARKETS
