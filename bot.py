@@ -90,18 +90,31 @@ def get_markets(limit=20):
         )
         r.raise_for_status()
         raw = r.json().get("markets", [])
-        return [
-            {
+        markets_out = []
+        skipped = 0
+        for m in raw:
+            yes_bid = round(float(m.get("yes_bid_dollars") or 0) * 100)
+            no_bid  = round(float(m.get("no_bid_dollars")  or 0) * 100)
+            # Skip markets with missing, zero, or extreme prices
+            if yes_bid < 2 or yes_bid > 98 or no_bid < 2 or no_bid > 98:
+                skipped += 1
+                continue
+            markets_out.append({
                 "id": m["ticker"],
                 "title": m.get("title", m["ticker"]),
-                "yes_bid": round(float(m.get("yes_bid_dollars", 0.5)) * 100),
-                "no_bid": round(float(m.get("no_bid_dollars", 0.5)) * 100),
+                "yes_bid": yes_bid,
+                "no_bid": no_bid,
                 "category": m.get("category", "General"),
                 "volume": float(m.get("volume_fp", 0)) * 100,
                 "close_time": m.get("close_time", ""),
-            }
-            for m in raw
-        ]
+            })
+        if skipped:
+            log.info(f"Skipped {skipped} markets with invalid/extreme prices")
+        if not markets_out:
+            log.warning("No valid markets from API — using demo markets")
+            return DEMO_MARKETS
+        log.info(f"Loaded {len(markets_out)} valid markets from Kalshi")
+        return markets_out
     except Exception as e:
         log.warning(f"Market fetch failed: {e} — using demo markets")
         return DEMO_MARKETS
