@@ -168,14 +168,20 @@ def detect_whales(trades):
 # ── Kelly Math ────────────────────────────────────────────────────────────────
 def kelly_fraction(p, b):
     """Full Kelly: f* = (b*p - q) / b"""
+    if b <= 0:
+        return 0.0
     q = 1 - p
     f = (b * p - q) / b
     return max(0.0, f)
 
 def kelly_bet(prob_pct, market_price_cents, whale_boost_pct=0):
+    # Guard: skip markets with invalid prices
+    price_cents = max(1, min(99, market_price_cents or 50))
     p = min(0.97, max(0.03, (prob_pct + whale_boost_pct) / 100))
-    price = market_price_cents / 100
+    price = price_cents / 100
     b = (1 - price) / price          # net payout per $1 wagered
+    if b <= 0:
+        return {"f": 0, "f_raw": 0, "bet_size": 0, "b": b, "p": p, "edge": 0, "price": price}
     f = kelly_fraction(p, b)
     f_capped = min(f, KELLY_CAP)
     bet_size = round(f_capped * bankroll, 2)
