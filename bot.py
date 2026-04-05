@@ -362,6 +362,15 @@ Respond ONLY with valid JSON (no markdown, no preamble):
 def run_compound_cycle(markets, whale_signals):
     global bankroll, peak_bankroll, wins, losses, total_trades, growth_log
 
+    global bankroll
+    # Sync real balance from Kalshi before each cycle
+    if not DEMO_MODE and KALSHI_API_KEY:
+        live_bal = get_balance()
+        if live_bal is not None and live_bal > 0:
+            if abs(live_bal - bankroll) > 0.01:
+                log.info(f"Balance sync: bot had ${bankroll:.2f}, Kalshi shows ${live_bal:.2f}")
+            bankroll = live_bal
+            peak_bankroll = max(peak_bankroll, bankroll)
     log.info("=" * 60)
     log.info(f"Compound cycle | Bankroll: ${bankroll:.2f} | Trades: {total_trades} | W/L: {wins}/{losses}")
 
@@ -440,14 +449,17 @@ def run_compound_cycle(markets, whale_signals):
 
     if won:
         payout  = round(bet_amt * (1 / best_kelly["price"] - 1), 2)
-        bankroll = round(bankroll + payout, 2)
         wins    += 1
-        peak_bankroll = max(peak_bankroll, bankroll)
+        if DEMO_MODE:
+            bankroll = round(bankroll + payout, 2)
+            peak_bankroll = max(peak_bankroll, bankroll)
         pct = (bankroll - STARTING_BANKROLL) / STARTING_BANKROLL * 100
-        log.info(f"  RESULT: WIN  +${payout:.2f}  →  Bankroll: ${bankroll:.2f}  ({pct:+.1f}% from start)")
+        log.info(f"  RESULT: WIN  +${payout:.2f} (est)  →  Bankroll: ${bankroll:.2f}  ({pct:+.1f}% from start)")
+        log.info(f"  (Live balance will sync from Kalshi on next cycle)")
     else:
-        bankroll = round(bankroll - bet_amt, 2)
         losses  += 1
+        if DEMO_MODE:
+            bankroll = round(bankroll - bet_amt, 2)
         pct = (bankroll - STARTING_BANKROLL) / STARTING_BANKROLL * 100
         log.info(f"  RESULT: LOSS -${bet_amt:.2f}  →  Bankroll: ${bankroll:.2f}  ({pct:+.1f}% from start)")
 
