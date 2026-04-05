@@ -196,7 +196,7 @@ def place_order(ticker, side, price_cents, count):
         log.info(f"[DEMO] Would place: {count}x {side.upper()} @ {price_cents}¢ on {ticker}")
         return True
     try:
-        path = "/trade-api/v2/orders"
+        path = "/trade-api/v2/portfolio/orders"
         payload = {
             "ticker": ticker,
             "action": "buy",
