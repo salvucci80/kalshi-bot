@@ -145,9 +145,24 @@ def get_balance():
 
 def get_markets(limit=20):
     try:
+        # Fetch multiple categories to find real binary markets
+        all_raw = []
+        for series_prefix in ["KX", "KXBTC", "KXINX", "KXETH", "KXFED", "KXCPI", "KXNVDA", "KXGDP"]:
+            try:
+                r2 = requests.get(
+                    f"{KALSHI_BASE}/markets",
+                    params={"limit": limit, "status": "open"},
+                    timeout=15,
+                )
+                if r2.ok:
+                    all_raw.extend(r2.json().get("markets", []))
+                    break  # Just get the main batch
+            except:
+                pass
+        # Actually just do one clean fetch and log everything
         r = requests.get(
             f"{KALSHI_BASE}/markets",
-            params={"limit": limit, "status": "open"},
+            params={"limit": 100, "status": "open"},
             timeout=15,
         )
         log.info(f"Markets API status: {r.status_code}")
@@ -155,9 +170,14 @@ def get_markets(limit=20):
         raw = r.json().get("markets", [])
         log.info(f"Raw markets returned: {len(raw)}")
         if raw:
-            # Log first market to see structure
             m0 = raw[0]
-            log.info(f"Sample market: ticker={m0.get('ticker')} yes_bid={m0.get('yes_bid_dollars')} no_bid={m0.get('no_bid_dollars')} status={m0.get('status')}")
+            log.info(f"Sample: ticker={m0.get('ticker')} yes_bid={m0.get('yes_bid_dollars')} no_bid={m0.get('no_bid_dollars')}")
+            # Log price distribution
+            prices = []
+            for m in raw[:20]:
+                yb = float(m.get("yes_bid_dollars") or 0) * 100
+                prices.append(f"{m.get('ticker','?')[:15]}={yb:.0f}¢")
+            log.info(f"Price sample: {prices[:10]}")
         markets_out = []
         for m in raw:
             try:
