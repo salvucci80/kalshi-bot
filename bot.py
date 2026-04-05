@@ -145,11 +145,10 @@ def get_balance():
 
 def get_markets(limit=20):
     try:
-        path = "/trade-api/v2/markets"
+        # Market data is public — no auth needed
         r = requests.get(
-            f"{KALSHI_TRADE}{path}",
+            f"{KALSHI_BASE}/markets",
             params={"limit": limit, "status": "open"},
-            headers=_sign("GET", path),
             timeout=10,
         )
         r.raise_for_status()
@@ -185,7 +184,7 @@ def get_markets(limit=20):
 
 def get_public_trades(limit=200):
     try:
-        r = requests.get(f"{KALSHI_TRADE}/trade-api/v2/trades", params={"limit": limit}, timeout=10)
+        r = requests.get(f"{KALSHI_BASE}/trades", params={"limit": limit}, timeout=10)
         r.raise_for_status()
         return r.json().get("trades", [])
     except Exception as e:
