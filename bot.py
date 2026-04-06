@@ -266,18 +266,22 @@ def place_order(ticker, side, price_cents, count):
     try:
         import uuid as _uuid
         path = "/trade-api/v2/portfolio/orders"
+        # Use fill_or_kill so order fills immediately or not at all
+        # Add 2¢ buffer above market price to ensure fills
+        fill_price = min(99, price_cents + 2)
         payload = {
             "ticker": ticker,
             "action": "buy",
             "side": side,
             "type": "limit",
+            "time_in_force": "fill_or_kill",
             "count": max(1, int(count)),
             "client_order_id": str(_uuid.uuid4()),
         }
         if side == "yes":
-            payload["yes_price"] = price_cents
+            payload["yes_price"] = fill_price
         else:
-            payload["no_price"] = price_cents
+            payload["no_price"] = fill_price
         hdrs = _sign("POST", path)
         log.info(f"Sending order to {KALSHI_TRADE}{path}")
         log.info(f"Payload: {payload}")
