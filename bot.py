@@ -1,589 +1,285 @@
 """
-Kalshi Kelly Compounder Bot
-===========================
-Runs forever. Finds the best edge on Kalshi markets,
-sizes bets with Kelly criterion, compounds 24/7.
-
-Usage:
-    python bot.py
-
-Config via .env file (see .env.example)
+Kalshi Kelly Compounder Bot — v5 Conservative
 """
-
-import os
-import time
-import json
-import math
-import random
-import logging
-import requests
+import os, time, json, logging, requests, base64, datetime as dt
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 import anthropic
-import base64
-import datetime as dt
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.backends import default_backend
 
 load_dotenv()
 
-# ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("bot.log", encoding="utf-8"),
-    ],
-)
+    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log", encoding="utf-8")])
 log = logging.getLogger("kalshi-bot")
 
-# ── Config ────────────────────────────────────────────────────────────────────
-KALSHI_API_KEY      = os.getenv("KALSHI_API_KEY", "")
-ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
-STARTING_BANKROLL   = float(os.getenv("STARTING_BANKROLL", "20.00"))
-CONFIDENCE_THRESH   = float(os.getenv("CONFIDENCE_THRESH", "70"))   # 0-100
-KELLY_CAP           = float(os.getenv("KELLY_CAP", "0.25"))          # max fraction of bankroll per bet
-WHALE_THRESHOLD     = int(os.getenv("WHALE_THRESHOLD", "500"))       # contracts
-WHALE_BOOST         = float(os.getenv("WHALE_BOOST", "8"))           # % conf boost when whale signal agrees
-CYCLE_INTERVAL      = int(os.getenv("CYCLE_INTERVAL", "60"))         # seconds between compound cycles
-DEMO_MODE           = os.getenv("DEMO_MODE", "true").lower() == "true"
-MAX_MARKETS_SCAN    = int(os.getenv("MAX_MARKETS_SCAN", "10"))
-# RSA private key as a string in env (paste full PEM including header/footer)
-KALSHI_PRIVATE_KEY  = os.getenv("KALSHI_PRIVATE_KEY", "")
+KALSHI_API_KEY     = os.getenv("KALSHI_API_KEY", "")
+ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+KALSHI_PRIVATE_KEY = os.getenv("KALSHI_PRIVATE_KEY", "")
+DEMO_MODE          = os.getenv("DEMO_MODE", "true").lower() == "true"
+STARTING_BANKROLL  = float(os.getenv("STARTING_BANKROLL", "20.00"))
+CYCLE_INTERVAL     = int(os.getenv("CYCLE_INTERVAL", "300"))
+
+CONFIDENCE_THRESH  = 80.0
+MIN_EDGE_CENTS     = 15
+KELLY_CAP          = 0.05
+MAX_CONTRACTS      = 3
+MIN_BALANCE        = 10.00
+PRICE_BUFFER       = 3
 
 KALSHI_BASE  = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_TRADE = "https://api.elections.kalshi.com"
 
+MARKET_SERIES = [
+    "KXBTCU", "KXETHU", "KXCPI", "KXPCE",
+    "KXFED", "KXUNEMPLOYMENT", "KXGDP",
+    "KXINXW", "KXSPX", "KXPOTUS", "KXSENATE", "KXDXY",
+]
+
 SOURCE_CREDIBILITY = {
-    "Reuters": 0.95, "Bloomberg": 0.93, "AP": 0.92, "WSJ": 0.90,
-    "FT": 0.89, "NYT": 0.87, "Politico": 0.82, "CoinDesk": 0.78,
-    "Twitter/X": 0.45, "Reddit": 0.38, "Unknown": 0.50,
+    "Reuters":0.95,"Bloomberg":0.93,"AP":0.92,"WSJ":0.90,
+    "FT":0.89,"NYT":0.87,"Politico":0.82,"CoinDesk":0.78,
+    "Twitter/X":0.45,"Reddit":0.38,"Unknown":0.50,
 }
 
-# ── State ─────────────────────────────────────────────────────────────────────
-bankroll      = STARTING_BANKROLL
+bankroll = STARTING_BANKROLL
 peak_bankroll = STARTING_BANKROLL
-wins          = 0
-losses        = 0
-total_trades  = 0
-growth_log    = [STARTING_BANKROLL]
+wins = losses = total_trades = 0
 
-# ── Kalshi API ────────────────────────────────────────────────────────────────
-def _load_private_key():
-    """Load RSA private key from env — handles PEM string with real or escaped newlines."""
-    if not KALSHI_PRIVATE_KEY:
-        log.warning("KALSHI_PRIVATE_KEY not set")
-        return None
+def _load_key():
+    if not KALSHI_PRIVATE_KEY: return None
     try:
-        pem_str = KALSHI_PRIVATE_KEY
-        # Handle escaped newlines stored in Railway
-        if "\\n" in pem_str:
-            pem_str = pem_str.replace("\\n", "\n")
-        pem_str = pem_str.replace("\n", "\n")
-        if not pem_str.strip().startswith("-----"):
-            log.error("KALSHI_PRIVATE_KEY doesn't look like PEM format")
-            return None
-        key = serialization.load_pem_private_key(
-            pem_str.encode("utf-8"), password=None, backend=default_backend()
-        )
-        log.info(f"RSA private key loaded OK ({type(key).__name__})")
-        return key
+        pem = KALSHI_PRIVATE_KEY.replace("\\n", "\n")
+        if not pem.strip().startswith("-----"): return None
+        return serialization.load_pem_private_key(pem.encode(), password=None, backend=default_backend())
     except Exception as e:
-        log.error(f"Failed to load private key: {e}")
-        return None
+        log.error(f"Key load error: {e}"); return None
 
-def _sign(method: str, path: str) -> dict:
-    """Sign a Kalshi API request with RSA-PSS per their official spec."""
-    private_key = _load_private_key()
-    if not private_key or not KALSHI_API_KEY:
-        log.warning("Missing key/key-id — request will be unsigned")
-        return {"Content-Type": "application/json"}
-    # Timestamp in milliseconds (integer string, no decimals)
-    ts_ms = str(int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000))
-    # Strip query params — Kalshi signs the path WITHOUT query string
-    path_no_query = path.split("?")[0]
-    # Message = timestamp + METHOD_UPPERCASE + path_without_query
-    msg_string = ts_ms + method.upper() + path_no_query
-    msg = msg_string.encode("utf-8")
-    log.debug(f"Signing msg: {msg_string[:80]}")
-    signature = private_key.sign(
-        msg,
-        asym_padding.PSS(
-            mgf=asym_padding.MGF1(hashes.SHA256()),
-            salt_length=asym_padding.PSS.DIGEST_LENGTH,
-        ),
-        hashes.SHA256(),
-    )
-    sig_b64 = base64.b64encode(signature).decode("utf-8")
-    return {
-        "Content-Type": "application/json",
-        "KALSHI-ACCESS-KEY": KALSHI_API_KEY,
-        "KALSHI-ACCESS-SIGNATURE": sig_b64,
-        "KALSHI-ACCESS-TIMESTAMP": ts_ms,
-    }
-
-def kalshi_headers():
-    return _sign("GET", "/trade-api/v2/portfolio/balance")
+def _sign(method, path):
+    key = _load_key()
+    if not key or not KALSHI_API_KEY: return {"Content-Type":"application/json"}
+    ts = str(int(dt.datetime.now(dt.timezone.utc).timestamp()*1000))
+    msg = (ts+method.upper()+path.split("?")[0]).encode()
+    sig = base64.b64encode(key.sign(msg, asym_padding.PSS(
+        mgf=asym_padding.MGF1(hashes.SHA256()), salt_length=asym_padding.PSS.DIGEST_LENGTH),
+        hashes.SHA256())).decode()
+    return {"Content-Type":"application/json","KALSHI-ACCESS-KEY":KALSHI_API_KEY,
+            "KALSHI-ACCESS-SIGNATURE":sig,"KALSHI-ACCESS-TIMESTAMP":ts}
 
 def get_balance():
     try:
         path = "/trade-api/v2/portfolio/balance"
-        hdrs = _sign("GET", path)
-        r = requests.get(f"{KALSHI_TRADE}{path}", headers=hdrs, timeout=10)
-        log.info(f"Balance API status: {r.status_code}")
-        if not r.ok:
-            log.error(f"Balance fetch error: {r.status_code} {r.text[:200]}")
-            return None
-        data = r.json()
-        log.info(f"Balance response: {data}")
-        # Kalshi returns balance in cents
-        bal = data.get("balance", 0) / 100
-        log.info(f"Available balance: ${bal:.2f}")
+        r = requests.get(f"{KALSHI_TRADE}{path}", headers=_sign("GET",path), timeout=10)
+        if not r.ok: log.error(f"Balance error {r.status_code}: {r.text[:150]}"); return None
+        d = r.json()
+        bal = d.get("balance",0)/100
+        pv  = d.get("portfolio_value",0)/100
+        log.info(f"Balance: ${bal:.2f} cash | ${pv:.2f} positions | ${bal+pv:.2f} total")
         return bal
     except Exception as e:
-        log.error(f"Balance fetch failed: {e}")
-        return None
+        log.error(f"Balance error: {e}"); return None
 
-def cancel_resting_orders():
-    """Cancel all open resting orders before placing a new one."""
+def cancel_all_resting():
     try:
         path = "/trade-api/v2/portfolio/orders"
-        hdrs = _sign("GET", path)
-        r = requests.get(f"{KALSHI_TRADE}{path}", params={"status": "resting"}, headers=hdrs, timeout=10)
-        if not r.ok:
-            log.warning(f"Could not fetch resting orders: {r.status_code}")
-            return
-        orders = r.json().get("orders", [])
-        if not orders:
-            return
-        log.info(f"Cancelling {len(orders)} resting orders to free balance...")
-        for order in orders:
-            oid = order.get("order_id")
-            if not oid:
-                continue
-            try:
-                del_path = f"/trade-api/v2/portfolio/orders/{oid}"
-                del_hdrs = _sign("DELETE", del_path)
-                dr = requests.delete(f"{KALSHI_TRADE}{del_path}", headers=del_hdrs, timeout=10)
-                if dr.ok:
-                    log.info(f"Cancelled order {oid[:8]}...")
-                else:
-                    log.warning(f"Could not cancel {oid[:8]}: {dr.status_code}")
-            except Exception as e:
-                log.warning(f"Cancel failed for {oid}: {e}")
+        r = requests.get(f"{KALSHI_TRADE}{path}", params={"status":"resting"},
+                         headers=_sign("GET",path), timeout=10)
+        if not r.ok: return
+        orders = r.json().get("orders",[])
+        if not orders: return
+        log.info(f"Cancelling {len(orders)} resting orders...")
+        for o in orders:
+            oid = o.get("order_id","")
+            if not oid: continue
+            dp = f"/trade-api/v2/portfolio/orders/{oid}"
+            dr = requests.delete(f"{KALSHI_TRADE}{dp}", headers=_sign("DELETE",dp), timeout=10)
+            log.info(f"  Cancel {oid[:8]}: {dr.status_code}")
     except Exception as e:
-        log.error(f"cancel_resting_orders failed: {e}")
+        log.error(f"Cancel error: {e}")
 
-def get_markets(limit=20):
-    try:
-        # Fetch from known series that have real binary markets with normal prices
-        # Sports parlay markets (KXMVE, KXMVECROSS) always have 0/100¢ prices
-        GOOD_SERIES = [
-            "KXINXW", "KXBTCU", "KXETHU", "KXFED", "KXCPI",
-            "KXGDP", "KXNVDA", "KXUNEMPLOYMENT", "KXSPX", "KXDXY",
-            "KXNFLWINNER", "KXPOTUS", "KXSENATE", "KXHOUSE",
-        ]
-        raw = []
-        for series in GOOD_SERIES:
-            try:
-                r2 = requests.get(
-                    f"{KALSHI_BASE}/markets",
-                    params={"limit": 10, "status": "open", "series_ticker": series},
-                    timeout=10,
-                )
-                if r2.ok:
-                    found = r2.json().get("markets", [])
-                    raw.extend(found)
-                    if found:
-                        log.info(f"Series {series}: {len(found)} markets, sample price={float(found[0].get('yes_bid_dollars') or 0)*100:.0f}¢")
-            except Exception as se:
-                log.debug(f"Series {series} failed: {se}")
-
-        if not raw:
-            # Fallback: paginate through markets to find ones with real prices
-            for page in range(5):
-                try:
-                    params = {"limit": 100, "status": "open"}
-                    r2 = requests.get(f"{KALSHI_BASE}/markets", params=params, timeout=15)
-                    if r2.ok:
-                        batch = r2.json().get("markets", [])
-                        for m in batch:
-                            yb = float(m.get("yes_bid_dollars") or 0) * 100
-                            nb = float(m.get("no_bid_dollars") or 0) * 100
-                            if 3 <= yb <= 97 and 3 <= nb <= 97:
-                                raw.append(m)
-                        if raw:
-                            break
-                except:
-                    break
-
-        log.info(f"Total candidate markets: {len(raw)}")
-        markets_out = []
-        for m in raw:
-            try:
-                yes_bid = round(float(m.get("yes_bid_dollars") or 0) * 100)
-                no_bid  = round(float(m.get("no_bid_dollars")  or 0) * 100)
-                # Skip zero prices and extreme prices (sports parlays etc)
-                if yes_bid < 1 or yes_bid > 99 or no_bid < 1 or no_bid > 99:
-                    continue
-                markets_out.append({
-                    "id": m["ticker"],
-                    "title": m.get("title", m["ticker"]),
-                    "yes_bid": yes_bid,
-                    "no_bid": no_bid,
-                    "category": m.get("category", "General"),
-                    "volume": float(m.get("volume_fp", 0)) * 100,
-                    "close_time": m.get("close_time", ""),
-                })
-            except Exception as me:
-                log.debug(f"Skipping market {m.get('ticker')}: {me}")
-        log.info(f"Loaded {len(markets_out)} valid live markets")
-        if markets_out:
-            log.info(f"Live tickers: {[m['id'] for m in markets_out[:5]]}")
-            return markets_out
-        log.warning(f"No valid markets after filtering {len(raw)} raw markets — waiting for next cycle")
-        return []
-    except Exception as e:
-        log.warning(f"Market fetch failed: {e}")
-        return []
-
-def get_public_trades(limit=200):
-    try:
-        r = requests.get(f"{KALSHI_BASE}/trades", params={"limit": limit}, timeout=10)
-        r.raise_for_status()
-        return r.json().get("trades", [])
-    except Exception as e:
-        log.warning(f"Trade feed fetch failed: {e}")
-        return []
+def get_markets():
+    markets = []
+    seen = set()
+    for series in MARKET_SERIES:
+        try:
+            r = requests.get(f"{KALSHI_BASE}/markets",
+                             params={"limit":5,"status":"open","series_ticker":series}, timeout=10)
+            if not r.ok: continue
+            for m in r.json().get("markets",[]):
+                tid = m.get("ticker","")
+                if tid in seen: continue
+                seen.add(tid)
+                yb = round(float(m.get("yes_bid_dollars") or 0)*100)
+                nb = round(float(m.get("no_bid_dollars") or 0)*100)
+                if yb < 5 or yb > 95 or nb < 5 or nb > 95: continue
+                markets.append({"id":tid,"title":m.get("title",tid),
+                    "yes_bid":yb,"no_bid":nb,"category":m.get("category",series),
+                    "close_time":m.get("close_time",""),"volume":float(m.get("volume_fp",0))})
+        except Exception as e:
+            log.debug(f"Series {series}: {e}")
+        time.sleep(0.2)
+    log.info(f"Loaded {len(markets)} tradeable markets | {[m['id'] for m in markets[:5]]}")
+    return markets
 
 def place_order(ticker, side, price_cents, count):
     if DEMO_MODE:
-        log.info(f"[DEMO] Would place: {count}x {side.upper()} @ {price_cents}¢ on {ticker}")
+        log.info(f"[DEMO] {count}x {side.upper()} @ {price_cents}¢ on {ticker}")
         return True
     try:
-        import uuid as _uuid
+        import uuid
         path = "/trade-api/v2/portfolio/orders"
-        # Use immediate_or_cancel with small count to get real fills
-        # Price buffer +3¢ to cross the spread and match resting orders
-        fill_price = min(99, price_cents + 3)
-        # Cap at 5 contracts max to match available liquidity
-        fill_count = min(max(1, int(count)), 5)
-        payload = {
-            "ticker": ticker,
-            "action": "buy",
-            "side": side,
-            "type": "limit",
-            "time_in_force": "immediate_or_cancel",
-            "count": fill_count,
-            "client_order_id": str(_uuid.uuid4()),
-        }
-        if side == "yes":
-            payload["yes_price"] = fill_price
-        else:
-            payload["no_price"] = fill_price
-        log.info(f"Order: {fill_count} contracts @ {fill_price}¢ IOC")
-        hdrs = _sign("POST", path)
-        log.info(f"Sending order to {KALSHI_TRADE}{path}")
-        log.info(f"Payload: {payload}")
-        r = requests.post(
-            f"{KALSHI_TRADE}{path}",
-            headers=hdrs,
-            json=payload,
-            timeout=10,
-        )
-        log.info(f"Order response status: {r.status_code}")
-        log.info(f"Order response body: {r.text[:500]}")
-        if r.status_code in (200, 201):
-            log.info(f"Order placed successfully!")
+        fp = min(99, price_cents + PRICE_BUFFER)
+        sc = min(max(1,int(count)), MAX_CONTRACTS)
+        payload = {"ticker":ticker,"action":"buy","side":side,"type":"limit",
+                   "time_in_force":"immediate_or_cancel","count":sc,
+                   "client_order_id":str(uuid.uuid4())}
+        if side=="yes": payload["yes_price"]=fp
+        else: payload["no_price"]=fp
+        log.info(f"IOC order: {sc}x {side.upper()} @ {fp}¢ on {ticker}")
+        r = requests.post(f"{KALSHI_TRADE}{path}", headers=_sign("POST",path),
+                          json=payload, timeout=10)
+        log.info(f"Response {r.status_code}: {r.text[:250]}")
+        if r.status_code in (200,201):
+            order = r.json().get("order",{})
+            filled = float(order.get("fill_count_fp",0))
+            status = order.get("status","?")
+            log.info(f"Status: {status} | Filled: {filled} contracts")
             return True
-        else:
-            log.error(f"Order failed {r.status_code}: {r.text[:400]}")
-            return False
-    except Exception as e:
-        log.error(f"Order failed: {e}")
+        log.error(f"Order failed {r.status_code}: {r.text[:200]}")
         return False
+    except Exception as e:
+        log.error(f"Order exception: {e}"); return False
 
-# ── Whale Detection ───────────────────────────────────────────────────────────
-def detect_whales(trades):
-    signals = {}
-    whale_count = 0
-    for t in trades:
-        count = float(t.get("count_fp", 0))
-        if count < WHALE_THRESHOLD:
-            continue
-        ticker = t.get("ticker", "")
-        side   = t.get("taker_side", "yes")
-        whale_count += 1
-        if ticker not in signals:
-            signals[ticker] = {"side": side, "count": 0, "total_size": 0}
-        signals[ticker]["count"] += 1
-        signals[ticker]["total_size"] += count
-        if signals[ticker]["side"] != side:
-            signals[ticker]["side"] = "mixed"
-    if whale_count:
-        log.info(f"Whale scan: {whale_count} large trades across {len(signals)} markets")
-    return signals
+def kelly_bet(ai_prob, mkt_price_cents):
+    p = min(0.97, max(0.03, ai_prob/100))
+    price = max(1, min(99, mkt_price_cents))/100
+    b = (1-price)/price
+    if b <= 0: return {"f":0,"bet_size":0,"edge":-1,"p":p,"price":price}
+    f = min(max(0,(b*p-(1-p))/b), KELLY_CAP)
+    bet = round(min(f*bankroll, bankroll*0.90), 2)
+    edge = p-(1-p)/b
+    return {"f":f,"bet_size":bet,"edge":edge,"p":p,"price":price}
 
-# ── Kelly Math ────────────────────────────────────────────────────────────────
-def kelly_fraction(p, b):
-    """Full Kelly: f* = (b*p - q) / b"""
-    if b <= 0:
-        return 0.0
-    q = 1 - p
-    f = (b * p - q) / b
-    return max(0.0, f)
-
-def kelly_bet(prob_pct, market_price_cents, whale_boost_pct=0):
-    # Guard: skip markets with invalid prices
-    price_cents = max(1, min(99, market_price_cents or 50))
-    p = min(0.97, max(0.03, (prob_pct + whale_boost_pct) / 100))
-    price = price_cents / 100
-    b = (1 - price) / price          # net payout per $1 wagered
-    if b <= 0:
-        return {"f": 0, "f_raw": 0, "bet_size": 0, "b": b, "p": p, "edge": 0, "price": price}
-    f = kelly_fraction(p, b)
-    f_capped = min(f, KELLY_CAP)
-    # Hard cap: never bet more than 90% of bankroll to leave buffer for fees/rounding
-    max_bet = round(bankroll * 0.90, 2)
-    bet_size = round(min(f_capped * bankroll, max_bet), 2)
-    edge = p - (1 - p) / b
-    return {
-        "f": f_capped,
-        "f_raw": f,
-        "bet_size": bet_size,
-        "b": b,
-        "p": p,
-        "edge": edge,
-        "price": price,
-    }
-
-# ── AI Prediction ─────────────────────────────────────────────────────────────
-def run_prediction(market, whale_signal=None):
-    whale_ctx = ""
-    if whale_signal:
-        whale_ctx = (
-            f"\nWHALE SIGNAL: {whale_signal['count']} large trades detected, "
-            f"majority direction: {whale_signal['side'].upper()} "
-            f"({round(whale_signal['total_size']):,} contracts). "
-            f"Factor as potential smart money signal."
-        )
+def run_prediction(market):
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    prompt = f"""You are a prediction market analyst on Kalshi optimizing for Kelly criterion compounding.
+    prompt = f"""You are a conservative prediction market analyst. Only trade when you have GENUINE edge.
 
 Market: "{market['title']}"
-Category: {market['category']}
-YES price: {market['yes_bid']}¢ | NO price: {market['no_bid']}¢
-Close time: {market.get('close_time','TBD')}
-Now (UTC): {now_utc}{whale_ctx}
+YES price: {market['yes_bid']}¢ (market says {market['yes_bid']}% likely)
+NO price: {market['no_bid']}¢ (market says {market['no_bid']}% likely)  
+Closes: {market.get('close_time','?')}
+Now: {now_utc}
 
-Assess edge vs market pricing carefully. Be conservative — only flag high-confidence edges.
+Rules:
+- Your probability estimate must differ from market by 15+ percentage points to have edge
+- If market seems fairly priced, set no_edge: true
+- Be honest and conservative — prediction markets are efficient
+- Never invent fake confidence
 
-Respond ONLY with valid JSON (no markdown, no preamble):
-{{"side":"yes" or "no","targetPrice":<1-99>,"confidence":<50-99>,"reasoning":"<2 sentences>","sources":["Reuters","Bloomberg","AP","WSJ","FT","NYT","CoinDesk","Politico","Twitter/X","Unknown"]}}"""
-
+Reply ONLY with JSON:
+{{"side":"yes" or "no","my_prob":<0-100>,"confidence":<50-95>,"no_edge":<true/false>,"reasoning":"<2 sentences>","sources":["Reuters","Bloomberg","AP","WSJ","FT","NYT","CoinDesk","Politico","Unknown"]}}"""
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        msg = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = msg.content[0].text.strip()
-        pred = json.loads(text.replace("```json", "").replace("```", "").strip())
-        sources = pred.get("sources", ["Unknown"])
-        src_avg = sum(SOURCE_CREDIBILITY.get(s, 0.5) for s in sources) / len(sources)
-        pred["blended_conf"] = round(pred["confidence"] * 0.65 + pred["confidence"] * src_avg * 0.35)
+        msg = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=300,
+                                     messages=[{"role":"user","content":prompt}])
+        pred = json.loads(msg.content[0].text.strip().replace("```json","").replace("```","").strip())
+        if pred.get("no_edge"): return None
+        sources = pred.get("sources",["Unknown"])
+        src = sum(SOURCE_CREDIBILITY.get(s,0.5) for s in sources)/max(len(sources),1)
+        pred["blended_conf"] = round(pred["confidence"]*0.7 + pred["confidence"]*src*0.3)
+        side = pred.get("side","yes")
+        mkt  = market["yes_bid"] if side=="yes" else market["no_bid"]
+        pred["prob_edge"] = pred.get("my_prob",50) - mkt
         return pred
     except Exception as e:
-        log.error(f"Prediction failed for {market['id']}: {e}")
-        return None
+        log.error(f"Prediction error {market['id']}: {e}"); return None
 
-# ── Compound Cycle ────────────────────────────────────────────────────────────
-def run_compound_cycle(markets, whale_signals):
-    global bankroll, peak_bankroll, wins, losses, total_trades, growth_log
+def run_cycle(markets):
+    global bankroll, peak_bankroll, wins, losses, total_trades
 
-    global bankroll
-    # Sync real balance from Kalshi before each cycle
     if not DEMO_MODE and KALSHI_API_KEY:
-        live_bal = get_balance()
-        if live_bal is not None and live_bal > 0:
-            if abs(live_bal - bankroll) > 0.01:
-                log.info(f"Balance sync: bot had ${bankroll:.2f}, Kalshi shows ${live_bal:.2f}")
-            bankroll = live_bal
+        bal = get_balance()
+        if bal is not None and bal > 0:
+            bankroll = bal
             peak_bankroll = max(peak_bankroll, bankroll)
-    # Cancel any previous resting orders to free up balance
-    if not DEMO_MODE and KALSHI_API_KEY:
-        cancel_resting_orders()
 
-    log.info("=" * 60)
-    log.info(f"Compound cycle | Bankroll: ${bankroll:.2f} | Trades: {total_trades} | W/L: {wins}/{losses}")
-
-    best_market  = None
-    best_kelly   = None
-    best_edge    = -999
-    best_pred    = None
-    best_boost   = 0
-
-    scan_markets = markets[:MAX_MARKETS_SCAN]
-    if not scan_markets:
-        log.warning("No markets available this cycle — skipping")
+    if bankroll < MIN_BALANCE and not DEMO_MODE:
+        log.warning(f"Balance ${bankroll:.2f} below min ${MIN_BALANCE:.2f} — paused")
         return
-    log.info(f"Scanning {len(scan_markets)} markets...")
-    log.info(f"Market tickers: {[m['id'] for m in scan_markets]}")
 
-    for m in scan_markets:
-        ws = whale_signals.get(m["id"])
-        whale_boost = 0
-        if ws and ws["side"] in ("yes", "no"):
-            whale_boost = WHALE_BOOST
+    if not DEMO_MODE and KALSHI_API_KEY:
+        cancel_all_resting()
 
-        pred = run_prediction(m, ws)
-        if not pred:
-            continue
+    log.info("="*60)
+    log.info(f"Cycle | ${bankroll:.2f} | Trades:{total_trades} | W/L:{wins}/{losses}")
 
-        conf = min(99, pred["blended_conf"] + whale_boost)
+    best = None
+    for m in markets:
+        pred = run_prediction(m)
+        if not pred: continue
+        conf  = pred["blended_conf"]
+        pedge = pred.get("prob_edge",0)
+        side  = pred["side"]
+        price = m["yes_bid"] if side=="yes" else m["no_bid"]
         if conf < CONFIDENCE_THRESH:
-            log.debug(f"  {m['id']}: {conf}% — below threshold, skipping")
+            log.info(f"  {m['id'][:20]:20s} | {side.upper()} | conf {conf}% — below {CONFIDENCE_THRESH:.0f}%")
             continue
+        if abs(pedge) < MIN_EDGE_CENTS:
+            log.info(f"  {m['id'][:20]:20s} | {side.upper()} | edge {pedge:+.0f}¢ — below {MIN_EDGE_CENTS}¢")
+            continue
+        k = kelly_bet(pred["my_prob"], price)
+        if k["edge"] <= 0 or k["bet_size"] < 0.50:
+            log.info(f"  {m['id'][:20]:20s} | Kelly edge negative — skip")
+            continue
+        log.info(f"  {m['id'][:20]:20s} | {side.upper()} {conf}% | edge {pedge:+.0f}¢ | f*={k['f']*100:.1f}% → ${k['bet_size']:.2f} ✓")
+        if best is None or k["edge"] > best["kelly"]["edge"]:
+            best = {"market":m,"pred":pred,"kelly":k,"side":side,"price":price}
+        time.sleep(0.4)
 
-        price = m["yes_bid"] if pred["side"] == "yes" else m["no_bid"]
-        k = kelly_bet(conf, price, 0)
-
-        if k["edge"] > best_edge and k["bet_size"] >= 0.01:
-            best_edge    = k["edge"]
-            best_market  = m
-            best_kelly   = k
-            best_kelly["side"] = pred["side"]
-            best_kelly["conf"] = conf
-            best_pred    = pred
-            best_boost   = whale_boost
-
-        log.info(
-            f"  {m['id'][:20]:20s} | {pred['side'].upper():3s} {conf}% | "
-            f"edge {k['edge']*100:+.1f}% | f*={k['f']*100:.1f}% → ${k['bet_size']:.2f}"
-        )
-        time.sleep(0.5)  # gentle rate limiting between AI calls
-
-    if not best_market or not best_kelly or best_kelly["bet_size"] < 0.01:
-        log.warning("No qualifying trade this cycle — holding bankroll")
+    if not best:
+        log.info(f"No qualifying trades — holding. (need {CONFIDENCE_THRESH:.0f}%+ conf & {MIN_EDGE_CENTS}¢+ edge)")
         return
 
-    side     = best_kelly["side"]
-    bet_amt  = best_kelly["bet_size"]
-    price    = best_market["yes_bid"] if side == "yes" else best_market["no_bid"]
-    b        = best_kelly["b"]
-    p        = best_kelly["p"]
+    m,k,side,price,pred = best["market"],best["kelly"],best["side"],best["price"],best["pred"]
+    bet = k["bet_size"]
+    contracts = max(1, int(bet/(price/100)))
+    log.info(f"BEST: {m['title'][:55]}")
+    log.info(f"  {side.upper()} @ {price}¢ | ${bet:.2f} | {contracts}ct | AI:{pred['my_prob']}% vs mkt:{price}¢")
+    log.info(f"  {pred['reasoning']}")
 
-    log.info(f"BEST TRADE: {best_market['title'][:60]}")
-    log.info(f"  Side: {side.upper()} @ {price}¢  |  Bet: ${bet_amt:.2f}  |  f*: {best_kelly['f']*100:.1f}%")
-    log.info(f"  Edge: {best_kelly['edge']*100:+.2f}%  |  Confidence: {best_kelly['conf']}%  |  Whale boost: +{best_boost}%")
-    log.info(f"  Reasoning: {best_pred['reasoning']}")
-
-    # Place the trade
-    contracts = max(1, int(bet_amt / (price / 100)))
-    order_ok  = place_order(best_market["id"], side, price, contracts)
-
-    if not order_ok:
-        log.error("Order placement failed — skipping bankroll update")
-        return
-
-    # Simulate outcome (demo) or use known result (live — would need settlement logic)
-    won = random.random() < p
+    ok = place_order(m["id"], side, price, contracts)
     total_trades += 1
+    if ok: wins += 1
+    else: losses += 1
 
-    if won:
-        payout  = round(bet_amt * (1 / best_kelly["price"] - 1), 2)
-        wins    += 1
-        if DEMO_MODE:
-            bankroll = round(bankroll + payout, 2)
-            peak_bankroll = max(peak_bankroll, bankroll)
-        pct = (bankroll - STARTING_BANKROLL) / STARTING_BANKROLL * 100
-        log.info(f"  RESULT: WIN  +${payout:.2f} (est)  →  Bankroll: ${bankroll:.2f}  ({pct:+.1f}% from start)")
-        log.info(f"  (Live balance will sync from Kalshi on next cycle)")
-    else:
-        losses  += 1
-        if DEMO_MODE:
-            bankroll = round(bankroll - bet_amt, 2)
-        pct = (bankroll - STARTING_BANKROLL) / STARTING_BANKROLL * 100
-        log.info(f"  RESULT: LOSS -${bet_amt:.2f}  →  Bankroll: ${bankroll:.2f}  ({pct:+.1f}% from start)")
+    wr = wins/total_trades*100 if total_trades else 0
+    dd = (peak_bankroll-bankroll)/peak_bankroll*100 if peak_bankroll>0 else 0
+    log.info(f"  Peak:${peak_bankroll:.2f} | Drawdown:{dd:.1f}% | Fill rate:{wr:.0f}%")
 
-    drawdown = (peak_bankroll - bankroll) / peak_bankroll * 100 if peak_bankroll > 0 else 0
-    win_rate = wins / total_trades * 100 if total_trades else 0
-    log.info(f"  Peak: ${peak_bankroll:.2f}  |  Drawdown: {drawdown:.1f}%  |  Win rate: {win_rate:.0f}%")
-    growth_log.append(bankroll)
-
-    if bankroll < 0.10:
-        log.critical("Bankroll below $0.10 — stopping to prevent ruin. Restart to reset.")
-        raise SystemExit(1)
-
-# ── Demo Markets ──────────────────────────────────────────────────────────────
-DEMO_MARKETS = [
-    {"id":"FED-MAY26","title":"Will the Fed cut rates in May 2026?","yes_bid":34,"no_bid":66,"category":"Economics","volume":842300,"close_time":"2026-05-08T18:00:00Z"},
-    {"id":"CPI-APR26","title":"Will US CPI be below 3% in April 2026?","yes_bid":58,"no_bid":42,"category":"Economics","volume":521000,"close_time":"2026-05-15T18:00:00Z"},
-    {"id":"BTC-100K","title":"Will Bitcoin hit $100k before June 2026?","yes_bid":41,"no_bid":59,"category":"Crypto","volume":1240000,"close_time":"2026-05-31T23:59:00Z"},
-    {"id":"SPX-5800","title":"Will S&P 500 close above 5800 in April 2026?","yes_bid":63,"no_bid":37,"category":"Finance","volume":987000,"close_time":"2026-04-30T21:00:00Z"},
-    {"id":"NVDA-200","title":"Will Nvidia hit $200/share by end of Q2?","yes_bid":47,"no_bid":53,"category":"Finance","volume":710000,"close_time":"2026-06-30T20:00:00Z"},
-]
-
-# ── Main Loop ─────────────────────────────────────────────────────────────────
 def main():
     global bankroll
-
-    log.info("=" * 60)
-    log.info("Kalshi Kelly Compounder Bot starting up")
-    log.info(f"  Mode:        {'DEMO (no real trades)' if DEMO_MODE else '>>> LIVE TRADING <<<'}")
-    log.info(f"  Bankroll:    ${STARTING_BANKROLL:.2f}")
-    log.info(f"  Threshold:   {CONFIDENCE_THRESH}% confidence")
-    log.info(f"  Kelly cap:   {KELLY_CAP*100:.0f}% per trade")
-    log.info(f"  Interval:    {CYCLE_INTERVAL}s")
-    log.info(f"  Whale boost: +{WHALE_BOOST}% when signal agrees")
-    log.info("=" * 60)
-
-    if not ANTHROPIC_API_KEY:
-        log.critical("ANTHROPIC_API_KEY not set in .env — cannot run predictions. Exiting.")
-        raise SystemExit(1)
-
-    if not DEMO_MODE and not KALSHI_API_KEY:
-        log.critical("KALSHI_API_KEY not set and DEMO_MODE=false. Set key or enable demo mode.")
-        raise SystemExit(1)
-
-    # Pull live balance if connected
+    log.info("="*60)
+    log.info("Kalshi Bot v5 — Conservative")
+    log.info(f"  Mode: {'DEMO' if DEMO_MODE else 'LIVE'} | Conf:{CONFIDENCE_THRESH:.0f}% | Edge:{MIN_EDGE_CENTS}¢ | Kelly:{KELLY_CAP*100:.0f}% | Max:{MAX_CONTRACTS}ct | Stop:${MIN_BALANCE}")
+    log.info("="*60)
+    if not ANTHROPIC_API_KEY: log.critical("No ANTHROPIC_API_KEY"); raise SystemExit(1)
+    if not DEMO_MODE and not KALSHI_API_KEY: log.critical("No KALSHI_API_KEY"); raise SystemExit(1)
     if not DEMO_MODE and KALSHI_API_KEY:
-        live_bal = get_balance()
-        if live_bal is not None:
-            bankroll = live_bal
-            log.info(f"Live balance loaded: ${bankroll:.2f}")
-        else:
-            log.warning("Could not fetch balance — using configured starting bankroll")
-
+        bal = get_balance()
+        if bal: bankroll = bal; log.info(f"Live balance: ${bankroll:.2f}")
     cycle = 0
     while True:
         cycle += 1
-        log.info(f"\n{'─'*60}\nCYCLE {cycle}  |  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n{'─'*60}")
-
-        # Load markets
-        markets = get_markets(limit=MAX_MARKETS_SCAN + 5)
-
-        # Whale scan (public — no key needed)
-        trades = get_public_trades(limit=200)
-        whale_signals = detect_whales(trades) if trades else {}
-        if whale_signals:
-            log.info(f"Whale signals active: {list(whale_signals.keys())}")
-
-        # Run compound cycle
-        try:
-            run_compound_cycle(markets, whale_signals)
-        except SystemExit:
-            raise
-        except Exception as e:
-            log.error(f"Cycle error: {e}", exc_info=True)
-
-        log.info(f"Sleeping {CYCLE_INTERVAL}s until next cycle...\n")
+        log.info(f"\n{'─'*60}\nCYCLE {cycle} | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n{'─'*60}")
+        markets = get_markets()
+        try: run_cycle(markets)
+        except SystemExit: raise
+        except Exception as e: log.error(f"Cycle error: {e}", exc_info=True)
+        log.info(f"Sleeping {CYCLE_INTERVAL}s...\n")
         time.sleep(CYCLE_INTERVAL)
-
 
 if __name__ == "__main__":
     main()
